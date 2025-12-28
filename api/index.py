@@ -5,34 +5,34 @@ from spitch import AsyncSpitch
 
 app = FastAPI()
 
-# Initialize Spitch Client
-# We use os.getenv to keep your key safe in Vercel settings
-client = AsyncSpitch(api_key=os.getenv("SPITCH_API_KEY"))
+# Move the client initialization here or inside the function
+API_KEY = os.getenv("SPITCH_API_KEY")
 
 @app.post("/v1/tts")
 async def generate_speech(request: Request):
     try:
         data = await request.json()
         text = data.get("text")
-        
+        voice_id = request.query_params.get("voice", "sade")
+        lang_code = request.query_params.get("lang", "yo")
+
         if not text:
             raise HTTPException(status_code=400, detail="Text is required")
 
-        # ---------------------------------------------------------
-        # SETTINGS FOR YORUBA
-        # Voice options: "sade" (Female) or "femi" (Male)
-        # ---------------------------------------------------------
-        async with client.speech.with_streaming_response.generate(
-            language="yo", 
-            voice="sade", 
-            text=text
-        ) as response:
-            return StreamingResponse(
-                response.iter_bytes(), 
-                media_type="audio/mpeg"
-            )
+        # FIX: Define a generator that keeps the connection alive
+        async def audio_generator():
+            client = AsyncSpitch(api_key=API_KEY)
+            # Opening the stream INSIDE the generator ensures it stays open
+            async with client.speech.with_streaming_response.generate(
+                language=lang_code, 
+                voice=voice_id, 
+                text=text
+            ) as response:
+                async for chunk in response.iter_bytes():
+                    yield chunk
+
+        return StreamingResponse(audio_generator(), media_type="audio/mpeg")
 
     except Exception as e:
         print(f"Error: {str(e)}")
-        # Ultravox needs to know if something broke
         raise HTTPException(status_code=500, detail=str(e))
