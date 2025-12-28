@@ -1,92 +1,87 @@
 import os
 import httpx
-import asyncio
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
+from io import BytesIO
 
 app = FastAPI()
 API_KEY = os.getenv("SPITCH_API_KEY")
 
-# Standard MP3 Silence Frame (approx 26ms)
-SILENT_FRAME = (
-    b'\xff\xfb\x90\x64\x00\x0f\xf0\x00\x00\x69\x00\x00\x00\x08\x00\x00'
-    b'\x0d\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-    b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-    b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
-)
+@app.get("/health")
+async def health_check():
+    """Health check endpoint to verify the server is running"""
+    return {"status": "ok", "service": "spitch-ultravox-bridge"}
 
 @app.post("/v1/tts")
 async def generate_speech(request: Request):
+    """
+    Generate speech using Spitch API and return complete audio to Ultravox.
+    This version pre-buffers the entire audio to avoid streaming issues.
+    """
     try:
-        # 1. Parse Request
+        # 1. Parse the incoming request from Ultravox
         data = await request.json()
         text = data.get("text")
+        
+        # Get voice and language from URL parameters (allows flexibility)
         voice_id = request.query_params.get("voice", "sade")
         lang_code = request.query_params.get("lang", "yo")
 
         if not text:
             raise HTTPException(status_code=400, detail="Text is required")
 
-        # 2. Setup Spitch Request
+        print(f"Generating {lang_code} audio for: '{text[:50]}...' using voice '{voice_id}'")
+
+        # 2. Prepare the request to Spitch API
         spitch_url = "https://api.spi-tch.com/v1/speech"
+        
         headers = {
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json"
         }
+        
         payload = {
             "language": lang_code,
             "voice": voice_id,
             "text": text
         }
 
-        # 3. Define the Background Worker
-        # This will run Spitch in the background and push audio to a Queue
-        queue = asyncio.Queue()
-        
-        async def fetch_spitch():
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    async with client.stream("POST", spitch_url, json=payload, headers=headers) as resp:
-                        if resp.status_code != 200:
-                            print(f"Spitch Error {resp.status_code}")
-                            await queue.put(None) # Signal error/end
-                            return
+        # 3. Fetch the COMPLETE audio file from Spitch (blocking approach)
+        # This waits for Spitch to finish generating before sending anything
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(spitch_url, json=payload, headers=headers)
+            
+            if response.status_code != 200:
+                error_text = response.text
+                print(f"Spitch API Error {response.status_code}: {error_text}")
+                raise HTTPException(
+                    status_code=response.status_code, 
+                    detail=f"Spitch API failed: {error_text}"
+                )
+            
+            # Get the complete audio data
+            audio_data = response.content
+            
+            if len(audio_data) < 100:
+                print(f"Warning: Audio data suspiciously small ({len(audio_data)} bytes)")
+            else:
+                print(f"Successfully generated {len(audio_data)} bytes of audio")
 
-                        async for chunk in resp.aiter_bytes():
-                            await queue.put(chunk)
-            except Exception as e:
-                print(f"Fetch Error: {e}")
-            finally:
-                await queue.put(None) # Signal completion
-
-        # 4. The Main Stream Generator
-        async def stream_manager():
-            # Start fetching Spitch in the background
-            task = asyncio.create_task(fetch_spitch())
-
-            # While the background task is running...
-            while True:
-                try:
-                    # Check if we have real audio ready (don't wait long)
-                    # If the queue is empty, this raises TimeoutError immediately
-                    chunk = await asyncio.wait_for(queue.get(), timeout=0.01)
-                    
-                    if chunk is None: # End of stream signal
-                        break
-                    
-                    yield chunk
-
-                except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                    # NO AUDIO YET? Send Silence to keep Ultravox alive
-                    yield SILENT_FRAME
-                    # Sleep briefly to match MP3 frame duration (~26ms)
-                    await asyncio.sleep(0.020)
-
-        return StreamingResponse(
-            stream_manager(), 
-            media_type="audio/mpeg"
+        # 4. Return the complete audio to Ultravox
+        # Using Response instead of StreamingResponse for complete data
+        return Response(
+            content=audio_data,
+            media_type="audio/mpeg",
+            headers={
+                "Content-Length": str(len(audio_data)),
+                "Cache-Control": "no-cache"
+            }
         )
 
+    except httpx.TimeoutException:
+        print("Timeout waiting for Spitch API")
+        raise HTTPException(status_code=504, detail="Spitch API timeout")
+    
     except Exception as e:
-        print(f"System Error: {str(e)}")
+        print(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
