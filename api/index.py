@@ -9,7 +9,6 @@ API_KEY = os.getenv("SPITCH_API_KEY")
 @app.post("/v1/tts")
 async def generate_speech(request: Request):
     try:
-        # 1. Parse Request
         data = await request.json()
         text = data.get("text")
         
@@ -19,31 +18,33 @@ async def generate_speech(request: Request):
         if not text:
             raise HTTPException(status_code=400, detail="Text is required")
 
-        # 2. Define the Upstream Request (Manual Mode)
-        url = "https://api.spi-tch.com/v1/speech"
+        # Use the exact URL from your successful logs
+        spitch_url = "https://api.spi-tch.com/v1/speech"
+        
         headers = {
             "Authorization": f"Bearer {API_KEY}",
             "Content-Type": "application/json"
         }
+        
         payload = {
             "language": lang_code,
             "voice": voice_id,
-            "text": text
+            "text": text,
+            "stream": True  # <--- TRYING TO FORCE STREAMING
         }
 
-        # 3. Generator with Manual Client Control
         async def upstream_generator():
-            # We open the client manually so WE control when it closes
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                async with client.stream("POST", url, json=payload, headers=headers) as resp:
-                    # If Spitch returns an error (e.g. 401/500), print it
-                    if resp.status_code != 200:
-                        error_msg = await resp.read()
-                        print(f"Spitch API Error {resp.status_code}: {error_msg}")
-                        yield b"" 
-                        return
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream("POST", spitch_url, json=payload, headers=headers) as resp:
+                    # LOGGING: Print what Spitch is actually sending back
+                    print(f"Spitch Response Status: {resp.status_code}")
+                    print(f"Spitch Content-Type: {resp.headers.get('content-type')}")
 
-                    # Stream bytes one by one
+                    if resp.status_code != 200:
+                        error_text = await resp.aread()
+                        print(f"ERROR BODY: {error_text}")
+                        return 
+
                     async for chunk in resp.aiter_bytes():
                         yield chunk
 
