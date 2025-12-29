@@ -1,59 +1,55 @@
 import os
 import httpx
 import time
+import asyncio
 import json
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
-from typing import AsyncIterator
 
 app = FastAPI()
 API_KEY = os.getenv("SPITCH_API_KEY")
 
-# Helper for consistent log format
-def log(msg: str):
-    timestamp = time.strftime("%H:%M:%S")
-    print(f"[{timestamp}] {msg}", flush=True)
+# --- WAV CONFIGURATION ---
+# 1. WAV Header (RIFF/WAVE, 16-bit PCM, Mono, 24kHz)
+# This MUST be sent first so Ultravox knows it's a valid audio stream.
+WAV_HEADER = (
+    b'\x52\x49\x46\x46\x24\x00\x00\x00\x57\x41\x56\x45\x66\x6d\x74\x20'
+    b'\x10\x00\x00\x00\x01\x00\x01\x00\x80\x5e\x00\x00\x00\xbd\x00\x00'
+    b'\x02\x00\x10\x00\x64\x61\x74\x61\x00\x00\x00\x00'
+)
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "service": "spitch-ultravox-bridge"}
+# 2. PCM Silence (10ms of 0-byte audio)
+# We feed this to Ultravox while waiting for Spitch.
+PCM_SILENCE = b'\x00\x00' * 480 
+
+def log(msg: str):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 @app.post("/v1/tts")
 async def generate_speech(request: Request):
-    """
-    Enhanced TTS endpoint with real-time logging for debugging Ultravox interactions.
-    """
-    request_start = time.perf_counter()
     try:
-        # 1. Log Incoming Request (Raw Body)
-        # This shows exactly what text Ultravox is sending
+        # --- PARSE REQUEST ---
         try:
             body_bytes = await request.body()
-            body_str = body_bytes.decode("utf-8")
-            data = json.loads(body_str)
-            log(f"📥 ULTRAVOX REQUEST BODY: {body_str}")
-        except Exception as e:
-            log(f"⚠️ Could not parse body: {e}")
+            data = json.loads(body_bytes)
+            text = data.get("text")
+            log(f"📥 ULTRAVOX REQUEST: {text}")
+        except:
             raise HTTPException(status_code=400, detail="Invalid JSON")
 
-        text = data.get("text")
+        if not text:
+            raise HTTPException(status_code=400, detail="No text")
+
         voice_id = request.query_params.get("voice", "sade")
         lang_code = request.query_params.get("lang", "yo")
 
-        if not text:
-            log("❌ Error: No text provided in request")
-            raise HTTPException(status_code=400, detail="Text is required")
-
-        log(f"📝 PROCESSING: Voice='{voice_id}' | Lang='{lang_code}' | Text Length={len(text)}")
-
-        # 2. Configure Spitch
+        # --- SETUP SPITCH ---
         spitch_url = "https://api.spi-tch.com/v1/speech"
         headers = {
             "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
+            "Content-Type": "application/json"
         }
-        
-        # We request WAV format to make Ultravox happy
+        # Request WAV explicitly
         payload = {
             "language": lang_code,
             "voice": voice_id,
@@ -61,45 +57,79 @@ async def generate_speech(request: Request):
             "format": "wav" 
         }
 
-        async def audio_stream() -> AsyncIterator[bytes]:
-            log("🚀 Connecting to Spitch API...")
-            spitch_start = time.perf_counter()
+        # --- BACKGROUND WORKER ---
+        # This fetches Spitch audio in the background while main thread sends silence
+        queue = asyncio.Queue()
+
+        async def fetch_spitch_background():
+            start_time = time.perf_counter()
+            log("🚀 [Background] Requesting Spitch...")
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with client.stream("POST", spitch_url, json=payload, headers=headers) as resp:
+                        duration = time.perf_counter() - start_time
+                        
+                        if resp.status_code != 200:
+                            log(f"❌ [Background] Spitch Failed: {resp.status_code}")
+                            await queue.put(None) # Signal End
+                            return
+
+                        log(f"✅ [Background] Spitch Ready in {duration:.2f}s! Buffering...")
+                        
+                        # Strip Spitch's WAV Header (first 44 bytes) to avoid noise
+                        # We already sent our own header.
+                        first_chunk = True
+                        async for chunk in resp.aiter_bytes():
+                            if first_chunk and len(chunk) > 44:
+                                chunk = chunk[44:] # Skip header
+                                first_chunk = False
+                            elif first_chunk:
+                                continue # Skip small header-only chunks
+                            
+                            await queue.put(chunk)
+
+            except Exception as e:
+                log(f"🔥 [Background] Error: {e}")
+            finally:
+                await queue.put(None) # Always signal end
+
+        # --- MAIN STREAM GENERATOR ---
+        async def stream_manager():
+            # 1. Send Header IMMEDIATELY (Time = 0.0s)
+            yield WAV_HEADER
             
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                # We use stream() instead of post() to get headers immediately
-                async with client.stream("POST", spitch_url, json=payload, headers=headers) as response:
+            # 2. Start Spitch in Background
+            asyncio.create_task(fetch_spitch_background())
+
+            log("⏳ Sending Silence Loop to Ultravox...")
+            
+            # 3. Queue Loop
+            silence_count = 0
+            while True:
+                try:
+                    # Check Queue (Don't wait long, so we can send silence)
+                    chunk = queue.get_nowait()
                     
-                    # 3. Log Spitch Response Headers
-                    duration = time.perf_counter() - spitch_start
-                    log(f"✅ SPITCH CONNECTED in {duration:.2f}s")
-                    log(f"🔍 SPITCH HEADERS: Status={response.status_code} | Type={response.headers.get('content-type')}")
-
-                    if response.status_code != 200:
-                        error_msg = await response.aread()
-                        log(f"❌ SPITCH ERROR: {error_msg.decode('utf-8')}")
-                        raise HTTPException(status_code=response.status_code, detail="Spitch API Error")
-
-                    # 4. Stream and Log Chunks
-                    chunk_count = 0
-                    total_bytes = 0
+                    if chunk is None: # End of stream
+                        log("🏁 Audio Finished.")
+                        break
                     
-                    async for chunk in response.aiter_bytes():
-                        chunk_size = len(chunk)
-                        total_bytes += chunk_size
-                        chunk_count += 1
-                        
-                        # Log every 10th chunk to avoid spamming logs, but show activity
-                        if chunk_count % 10 == 1: 
-                            log(f"📤 Streaming Chunk #{chunk_count} ({chunk_size} bytes) to Ultravox...")
-                        
-                        yield chunk
+                    # We have real audio! Send it.
+                    if silence_count > 0:
+                        log(f"🔊 Real Audio Playing! (Stopped silence after {silence_count} frames)")
+                        silence_count = 0 # Reset
+                    yield chunk
 
-                    total_duration = time.perf_counter() - request_start
-                    log(f"🏁 COMPLETE: Streamed {total_bytes} bytes in {total_duration:.2f}s")
+                except asyncio.QueueEmpty:
+                    # Queue is empty = Spitch is still thinking.
+                    # Send Silence to keep Ultravox alive.
+                    yield PCM_SILENCE
+                    silence_count += 1
+                    await asyncio.sleep(0.01) # Sleep 10ms (matches PCM_SILENCE duration)
 
         return StreamingResponse(
-            audio_stream(),
-            media_type="audio/wav", # Set to WAV as requested
+            stream_manager(), 
+            media_type="audio/wav",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Content-Type-Options": "nosniff"
@@ -107,5 +137,5 @@ async def generate_speech(request: Request):
         )
 
     except Exception as e:
-        log(f"🔥 CRITICAL SYSTEM ERROR: {str(e)}")
+        log(f"System Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
